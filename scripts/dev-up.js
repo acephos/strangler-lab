@@ -1,9 +1,13 @@
 'use strict';
 
 /**
- * Start the partial-strangler demo stack in the foreground.
- * Ctrl+C stops all children.
+ * Start the full modernization stack in the foreground:
+ *   - Gateway :8000 (dynamic cutover, shadow traffic, metrics)
+ *   - Legacy Monolith :8080
+ *   - orders-go :8081 (reservations route through gateway)
+ *   - inventory-go :8082 (ready for slice 2 cutover)
  *
+ * Ctrl+C stops all children.
  *   node scripts/dev-up.js
  */
 
@@ -118,10 +122,9 @@ function shutdown() {
     'orders-go',
     path.join(ordersDir, `orders-go-bin${ext}`),
     [],
-    { PORT: '8081', INVENTORY_URL: 'http://127.0.0.1:8080' },
+    { PORT: '8081', INVENTORY_URL: 'http://127.0.0.1:8000' },
     ordersDir,
   );
-  // inventory-go is built and ready for full cutover demos, not routed by default.
   spawnProc(
     'inventory-go',
     path.join(invDir, `inventory-go-bin${ext}`),
@@ -150,14 +153,17 @@ function shutdown() {
   await waitPort(8000, 'gateway');
 
   console.log(`
-[dev-up] stack up (partial strangler)
-  gateway     http://127.0.0.1:8000   ← clients enter here
-  legacy      http://127.0.0.1:8080   inventory still here
-  orders-go   http://127.0.0.1:8081   orders cut over
-  inventory-go http://127.0.0.1:8082  ready; not routed yet
+[dev-up] Modernization Stack Live:
+  gateway       http://127.0.0.1:8000  ← Entrypoint (path cutover & shadow diffing)
+  legacy        http://127.0.0.1:8080  ← Monolith (orders + inventory)
+  orders-go     http://127.0.0.1:8081  ← Extracted Orders slice
+  inventory-go  http://127.0.0.1:8082  ← Extracted Inventory slice
 
+Quick commands:
   curl http://127.0.0.1:8000/__routes
+  curl http://127.0.0.1:8000/__shadow/stats
   node scripts/smoke.js
+  node agent/demo.js
   Ctrl+C to stop
 `);
 })().catch((err) => {

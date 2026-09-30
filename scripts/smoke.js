@@ -1,13 +1,17 @@
 'use strict';
 
 /**
- * End-to-end smoke through the gateway:
- *   create order → get order → check inventory
- * Default routing: orders → orders-go, inventory → legacy.
+ * End-to-end smoke test validating the multi-phase Strangler Fig cutover:
+ *   - Phase 1: Partial cutover (orders → orders-go, inventory → legacy)
+ *   - Phase 2: Full cutover (orders → orders-go, inventory → inventory-go)
+ *   - Shadow mode: Dark launch verification & divergence monitoring
+ *   - Automated rollback drill: Instant reversal without dropped traffic
  *
  * Usage:
  *   node scripts/smoke.js              # assumes stack already up
- *   node scripts/smoke.js --start      # start stack, smoke, stop
+ *   node scripts/smoke.js --start      # start stack, test all phases, stop
+ *   node scripts/smoke.js --phase=1    # test only phase 1
+ *   node scripts/smoke.js --phase=2    # test only phase 2
  */
 
 const http = require('node:http');
@@ -18,6 +22,9 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const ROOT = path.resolve(__dirname, '..');
 const GATEWAY = process.env.GATEWAY_URL || 'http://127.0.0.1:8000';
 const START = process.argv.includes('--start');
+
+const targetPhaseArg = process.argv.find((a) => a.startsWith('--phase='));
+const targetPhase = targetPhaseArg ? Number(targetPhaseArg.split('=')[1]) : null;
 
 const children = [];
 
@@ -108,14 +115,18 @@ async function buildGo(dir, out) {
 async function startStack() {
   log('building Go binaries...');
   const ordersDir = path.join(ROOT, 'services', 'orders-go');
+  const invDir = path.join(ROOT, 'services', 'inventory-go');
   const gwDir = path.join(ROOT, 'gateway');
-  const ordersBin = process.platform === 'win32' ? 'orders-go-bin.exe' : 'orders-go-bin';
-  const gwBin = process.platform === 'win32' ? 'gateway-bin.exe' : 'gateway-bin';
+  const ext = process.platform === 'win32' ? '.exe' : '';
+  const ordersBin = `orders-go-bin${ext}`;
+  const invBin = `inventory-go-bin${ext}`;
+  const gwBin = `gateway-bin${ext}`;
 
   await buildGo(ordersDir, ordersBin);
+  await buildGo(invDir, invBin);
   await buildGo(gwDir, gwBin);
 
-  log('starting legacy on :8080');
+  log('starting legacy monolith on :8080');
   spawnProc(
     process.execPath,
     [path.join(ROOT, 'legacy', 'server.js')],
@@ -123,15 +134,23 @@ async function startStack() {
     path.join(ROOT, 'legacy'),
   );
 
-  log('starting orders-go on :8081 (inventory → legacy)');
+  log('starting orders-go on :8081 (reservations routed via gateway :8000)');
   spawnProc(
     path.join(ordersDir, ordersBin),
     [],
-    { PORT: '8081', INVENTORY_URL: 'http://127.0.0.1:8080' },
+    { PORT: '8081', INVENTORY_URL: 'http://127.0.0.1:8000' },
     ordersDir,
   );
 
-  log('starting gateway on :8000 (orders→go, inventory→legacy)');
+  log('starting inventory-go on :8082');
+  spawnProc(
+    path.join(invDir, invBin),
+    [],
+    { PORT: '8082' },
+    invDir,
+  );
+
+  log('starting gateway on :8000');
   spawnProc(
     path.join(gwDir, gwBin),
     [],
@@ -148,8 +167,9 @@ async function startStack() {
 
   await waitUrl('http://127.0.0.1:8080/health');
   await waitUrl('http://127.0.0.1:8081/health');
+  await waitUrl('http://127.0.0.1:8082/health');
   await waitUrl('http://127.0.0.1:8000/health');
-  log('stack ready');
+  log('full stack ready (legacy, orders-go, inventory-go, gateway)');
 }
 
 function stopStack() {
@@ -169,55 +189,161 @@ function stopStack() {
   }
 }
 
-async function runSmoke() {
-  const base = GATEWAY.replace(/\/$/, '');
+async function testPhase1(base) {
+  log('==============================================');
+  log('PHASE 1: Partial Strangler (Orders=New, Inv=Legacy)');
+  log('==============================================');
 
-  log('GET /health');
+  await request(`${base}/__admin/cutover`, 'POST', {
+    ordersNew: true,
+    inventoryNew: false,
+    shadowOrders: false,
+    shadowInventory: false,
+  });
+
   const health = await request(`${base}/health`, 'GET');
-  if (health.status !== 200) throw new Error(`health failed: ${health.status}`);
-  log(`  routing: ${JSON.stringify(health.body.routing || health.body)}`);
-
-  log('GET /inventory/SKU-COFFEE-01 (expect legacy)');
-  const invBefore = await request(`${base}/inventory/SKU-COFFEE-01`, 'GET');
-  if (invBefore.status !== 200) throw new Error(`inventory get failed: ${JSON.stringify(invBefore.body)}`);
-  log(`  qty=${invBefore.body.quantity} served-by=${invBefore.servedBy} target=${invBefore.target}`);
-  if (invBefore.servedBy && invBefore.servedBy !== 'legacy-monolith') {
-    log(`  note: inventory served by ${invBefore.servedBy} (demo default is legacy)`);
+  if (health.body.routing.orders !== 'orders-go' || health.body.routing.inventory !== 'legacy') {
+    throw new Error(`unexpected Phase 1 routing: ${JSON.stringify(health.body.routing)}`);
   }
+  log(`  routing verified: orders -> orders-go, inventory -> legacy`);
 
-  log('POST /orders (expect orders-go, reserves via legacy inventory)');
+  // Inventory served by legacy
+  const invBefore = await request(`${base}/inventory/SKU-COFFEE-01`, 'GET');
+  if (invBefore.status !== 200 || invBefore.servedBy !== 'legacy-monolith') {
+    throw new Error(`expected inventory from legacy-monolith, got ${invBefore.servedBy}`);
+  }
+  log(`  inventory served-by=${invBefore.servedBy} (qty=${invBefore.body.quantity})`);
+
+  // Order served by orders-go
   const create = await request(`${base}/orders`, 'POST', {
-    customerId: 'smoke-customer',
+    customerId: 'cust-phase1',
     items: [{ sku: 'SKU-COFFEE-01', quantity: 2 }],
   });
-  if (create.status !== 201) {
-    throw new Error(`create order failed: ${create.status} ${JSON.stringify(create.body)}`);
+  if (create.status !== 201 || create.servedBy !== 'orders-go') {
+    throw new Error(`expected orders-go 201, got status=${create.status} served-by=${create.servedBy}`);
   }
-  log(`  id=${create.body.id} served-by=${create.servedBy} target=${create.target}`);
-  if (!create.body.id || create.body.status !== 'confirmed') {
-    throw new Error('order shape invalid');
+  log(`  order created id=${create.body.id} served-by=${create.servedBy}`);
+
+  // Fetch created order
+  const getOrd = await request(`${base}/orders/${create.body.id}`, 'GET');
+  if (getOrd.status !== 200 || getOrd.body.id !== create.body.id) {
+    throw new Error('fetch order failed');
   }
-  if (create.servedBy && create.servedBy !== 'orders-go') {
+
+  // Stock decremented on legacy
+  const invAfter = await request(`${base}/inventory/SKU-COFFEE-01`, 'GET');
+  if (invAfter.body.quantity !== invBefore.body.quantity - 2) {
+    throw new Error(`expected stock ${invBefore.body.quantity - 2}, got ${invAfter.body.quantity}`);
+  }
+  log(`  inventory decremented on legacy: ${invBefore.body.quantity} -> ${invAfter.body.quantity}`);
+  log('  ✔ Phase 1 smoke PASS\n');
+}
+
+async function testPhase2(base) {
+  log('==============================================');
+  log('PHASE 2: Full Strangler Cutover (Orders=New, Inv=New)');
+  log('==============================================');
+
+  log('promoting cutover via dynamic admin API: ROUTE_INVENTORY_NEW=true');
+  const cutoverRes = await request(`${base}/__admin/cutover`, 'POST', {
+    ordersNew: true,
+    inventoryNew: true,
+  });
+  if (cutoverRes.status !== 200) {
+    throw new Error(`cutover API failed: ${cutoverRes.status}`);
+  }
+  log(`  admin cutover response: ${JSON.stringify(cutoverRes.body.routing)}`);
+
+  // Inventory served by inventory-go
+  const invBefore = await request(`${base}/inventory/SKU-FILTER-100`, 'GET');
+  if (invBefore.status !== 200 || invBefore.servedBy !== 'inventory-go') {
+    throw new Error(`expected inventory from inventory-go, got ${invBefore.servedBy}`);
+  }
+  log(`  inventory served-by=${invBefore.servedBy} (qty=${invBefore.body.quantity})`);
+
+  // Order created via orders-go, reserving via inventory-go
+  const create = await request(`${base}/orders`, 'POST', {
+    customerId: 'cust-phase2',
+    items: [{ sku: 'SKU-FILTER-100', quantity: 5 }],
+  });
+  if (create.status !== 201 || create.servedBy !== 'orders-go') {
     throw new Error(`expected orders-go, got ${create.servedBy}`);
   }
+  log(`  order created id=${create.body.id} served-by=${create.servedBy}`);
 
-  log(`GET /orders/${create.body.id}`);
-  const got = await request(`${base}/orders/${create.body.id}`, 'GET');
-  if (got.status !== 200 || got.body.id !== create.body.id) {
-    throw new Error(`get order failed: ${JSON.stringify(got.body)}`);
+  // Stock decremented on inventory-go
+  const invAfter = await request(`${base}/inventory/SKU-FILTER-100`, 'GET');
+  if (invAfter.servedBy !== 'inventory-go') {
+    throw new Error(`expected inventory-go, got ${invAfter.servedBy}`);
   }
-  log(`  ok status=${got.body.status}`);
-
-  log('GET /inventory/SKU-COFFEE-01 after reserve');
-  const invAfter = await request(`${base}/inventory/SKU-COFFEE-01`, 'GET');
-  if (invAfter.status !== 200) throw new Error('inventory after failed');
-  const expected = invBefore.body.quantity - 2;
-  if (invAfter.body.quantity !== expected) {
-    throw new Error(`expected qty ${expected}, got ${invAfter.body.quantity}`);
+  if (invAfter.body.quantity !== invBefore.body.quantity - 5) {
+    throw new Error(`expected stock ${invBefore.body.quantity - 5}, got ${invAfter.body.quantity}`);
   }
-  log(`  qty=${invAfter.body.quantity} (decreased by 2)`);
+  log(`  inventory decremented on inventory-go: ${invBefore.body.quantity} -> ${invAfter.body.quantity}`);
+  log('  ✔ Phase 2 full cutover smoke PASS (0% legacy traffic)\n');
+}
 
-  log('SMOKE PASS');
+async function testShadowMode(base) {
+  log('==============================================');
+  log('SHADOW MODE & DIVERGENCE AUDITING');
+  log('==============================================');
+
+  // Reset shadow stats
+  await request(`${base}/__shadow/reset`, 'POST');
+
+  // Enable shadow mirroring for orders
+  log('activating shadow mirroring: primary=orders-go, shadow=legacy');
+  await request(`${base}/__admin/cutover`, 'POST', {
+    ordersNew: true,
+    shadowOrders: true,
+  });
+
+  // Send test requests
+  for (let i = 0; i < 3; i++) {
+    await request(`${base}/orders`, 'POST', {
+      customerId: `shadow-cust-${i}`,
+      items: [{ sku: 'SKU-MUG-12', quantity: 1 }],
+    });
+  }
+
+  await sleep(150); // allow async shadow dispatch to settle
+
+  const stats = await request(`${base}/__shadow/stats`, 'GET');
+  log(`  shadow stats: totalReqs=${stats.body.totalRequests}, shadowReqs=${stats.body.shadowRequests}, diffs=${stats.body.diffCount}`);
+  if (stats.body.diffCount > 0) {
+    throw new Error(`divergence detected in shadow mode: ${stats.body.diffCount} diffs`);
+  }
+  log('  ✔ Shadow traffic validation PASS (0% divergence)\n');
+}
+
+async function testRollbackDrill(base) {
+  log('==============================================');
+  log('SAFETY DRILL: Dynamic Automated Rollback');
+  log('==============================================');
+
+  log('simulating incident -> triggering rollback to Phase 0 (100% legacy)');
+  await request(`${base}/__admin/cutover`, 'POST', {
+    ordersNew: false,
+    inventoryNew: false,
+    shadowOrders: false,
+    shadowInventory: false,
+  });
+
+  const res = await request(`${base}/orders`, 'POST', {
+    customerId: 'cust-rollback',
+    items: [{ sku: 'SKU-COFFEE-01', quantity: 1 }],
+  });
+  if (res.status !== 201 || res.servedBy !== 'legacy-monolith') {
+    throw new Error(`expected legacy-monolith after rollback, got ${res.servedBy}`);
+  }
+  log(`  fallback verified: orders served-by=${res.servedBy}`);
+
+  log('re-promoting back to Phase 1');
+  await request(`${base}/__admin/cutover`, 'POST', {
+    ordersNew: true,
+    inventoryNew: false,
+  });
+  log('  ✔ Dynamic rollback and recovery PASS\n');
 }
 
 (async () => {
@@ -231,7 +357,24 @@ async function runSmoke() {
         );
       });
     }
-    await runSmoke();
+
+    const base = GATEWAY.replace(/\/$/, '');
+
+    if (targetPhase === 1) {
+      await testPhase1(base);
+    } else if (targetPhase === 2) {
+      await testPhase2(base);
+    } else {
+      await testPhase1(base);
+      await testPhase2(base);
+      await testShadowMode(base);
+      await testRollbackDrill(base);
+    }
+
+    log('==============================================');
+    log('🎉 ALL SMOKE & CUTOVER VERIFICATIONS PASSED');
+    log('==============================================');
+
     if (START) stopStack();
     process.exit(0);
   } catch (err) {

@@ -1,0 +1,16 @@
+{
+  "name": "strangler-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agentic Strangler Fig lab — modernize legacy monoliths to Go microservices with contract tests, shadow traffic, and dynamic cutover",
+  "scripts": {
+    "demo": "node agent/demo.js",
+    "smoke": "node scripts/smoke.js --start",
+    "contract": "cd contracts && npm test",
+    "test": "npm run contract && npm run smoke",
+    "up": "node scripts/dev-up.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
