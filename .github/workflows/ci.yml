@@ -29,9 +29,9 @@ jobs:
       - name: Verify Go Formatting & Compilation
         run: |
           gofmt -l gateway services/orders-go services/inventory-go
-          cd gateway && go build -v .
-          cd ../services/orders-go && go build -v .
-          cd ../services/inventory-go && go build -v .
+          (cd gateway && go build -v .)
+          (cd services/orders-go && go build -v .)
+          (cd services/inventory-go && go build -v .)
 
       - name: Run Dual-Domain Contract Tests
         run: |
