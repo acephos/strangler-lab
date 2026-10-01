@@ -8,10 +8,11 @@ services:
       - ./legacy:/app
     command: ["node", "server.js"]
     environment:
-      PORT: "8080"
       HOST: "0.0.0.0"
+      LAB_ADMIN_TOKEN: "${LAB_ADMIN_TOKEN:?set a shared local lab token}"
+      PORT: "8080"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   orders-go:
     image: golang:1.22-alpine
@@ -20,10 +21,12 @@ services:
       - ./services/orders-go:/src
     command: ["go", "run", "."]
     environment:
+      HOST: "0.0.0.0"
+      LAB_ADMIN_TOKEN: "${LAB_ADMIN_TOKEN:?set a shared local lab token}"
       PORT: "8081"
-      INVENTORY_URL: "http://legacy:8080"
+      INVENTORY_URL: "http://gateway:8000"
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     depends_on:
       - legacy
 
@@ -34,9 +37,11 @@ services:
       - ./services/inventory-go:/src
     command: ["go", "run", "."]
     environment:
+      HOST: "0.0.0.0"
+      LAB_ADMIN_TOKEN: "${LAB_ADMIN_TOKEN:?set a shared local lab token}"
       PORT: "8082"
     ports:
-      - "8082:8082"
+      - "127.0.0.1:8082:8082"
 
   gateway:
     image: golang:1.22-alpine
@@ -45,14 +50,16 @@ services:
       - ./gateway:/src
     command: ["go", "run", "."]
     environment:
+      HOST: "0.0.0.0"
+      LAB_ADMIN_TOKEN: "${LAB_ADMIN_TOKEN:?set a shared local lab token}"
       PORT: "8000"
       LEGACY_URL: "http://legacy:8080"
       ORDERS_URL: "http://orders-go:8081"
       INVENTORY_URL: "http://inventory-go:8082"
-      ROUTE_ORDERS_NEW: "true"
+      ROUTE_ORDERS_NEW: "false"
       ROUTE_INVENTORY_NEW: "false"
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       - legacy
       - orders-go

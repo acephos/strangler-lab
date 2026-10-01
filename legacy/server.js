@@ -11,10 +11,11 @@ const { randomUUID } = require('crypto');
 const { URL } = require('url');
 
 const PORT = Number(process.env.PORT || 8080);
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = process.env.HOST || '127.0.0.1';
 
 /** @type {Map<string, object>} */
 const orders = new Map();
+const reservations = new Map();
 
 /** @type {Map<string, { sku: string, name: string, quantity: number }>} */
 const inventory = new Map([
@@ -35,8 +36,8 @@ function send(res, status, body) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    const chunks = [];let size=0;let excessive=false;
+    req.on('data', (c) => {size+=c.length;if(size>1048576){if(!excessive)reject(Object.assign(new Error('body exceeds limit'),{status:413}));excessive=true;return;}chunks.push(c);});
     req.on('end', () => {
       if (!chunks.length) return resolve({});
       try {
@@ -60,30 +61,18 @@ function validateOrderCreate(body) {
   return null;
 }
 
-function createOrder(body) {
-  for (const item of body.items) {
-    const stock = inventory.get(item.sku);
-    if (!stock) {
-      const err = new Error(`unknown sku: ${item.sku}`);
-      err.status = 404;
-      throw err;
-    }
-    if (stock.quantity < item.quantity) {
-      const err = new Error(
-        `insufficient stock for ${item.sku}: have ${stock.quantity}, need ${item.quantity}`,
-      );
-      err.status = 409;
-      throw err;
-    }
+function createOrder(body, requestId = body.requestId || randomUUID()) {
+  if (typeof requestId !== 'string' || !requestId || requestId.length>200) throw Object.assign(new Error('invalid idempotency key'),{status:400});
+  for (const order of orders.values()) if (order.requestId===requestId) {
+    if (order.customerId!==body.customerId || JSON.stringify(order.items)!==JSON.stringify(body.items.map(item=>({sku:item.sku,quantity:item.quantity})))) throw Object.assign(new Error('idempotency key reused with different order'),{status:409});
+    return order;
   }
-  for (const item of body.items) {
-    const stock = inventory.get(item.sku);
-    stock.quantity -= item.quantity;
-  }
+  reserveBatch(body.items,requestId);
 
   const id = randomUUID();
   const order = {
     id,
+    requestId,
     customerId: body.customerId,
     items: body.items.map((i) => ({ sku: i.sku, quantity: i.quantity })),
     status: 'confirmed',
@@ -128,21 +117,82 @@ function reserveInventory(sku, quantity) {
   };
 }
 
+function reserveBatch(items, requestId) {
+  if (!Array.isArray(items) || !items.length) throw Object.assign(new Error('items (non-empty array) required'), {status:400});
+  const signature=JSON.stringify(items.map(item=>({sku:item?.sku,quantity:item?.quantity})));
+  if (requestId!==undefined) {
+    if (typeof requestId!=='string' || !requestId || requestId.length>200) throw Object.assign(new Error('invalid idempotency key'),{status:400});
+    if (reservations.has(requestId)) {
+      if (reservations.get(requestId)!==signature) throw Object.assign(new Error('idempotency key reused with different reservation'),{status:409});
+      return {reserved:true};
+    }
+  }
+  const totals = new Map();
+  for (const item of items) {
+    if (!item || typeof item.sku !== 'string' || !item.sku || !Number.isSafeInteger(item.quantity) || item.quantity < 1) throw Object.assign(new Error('invalid reservation item'), {status:400});
+    const total = (totals.get(item.sku) || 0) + item.quantity;
+    if (!Number.isSafeInteger(total)) throw Object.assign(new Error('quantity overflow'), {status:400});
+    totals.set(item.sku,total);
+  }
+  for (const [sku,quantity] of totals) {
+    const stock=inventory.get(sku);
+    if (!stock) throw Object.assign(new Error(`unknown sku: ${sku}`), {status:404});
+    if (stock.quantity < quantity) throw Object.assign(new Error(`insufficient stock for ${sku}: have ${stock.quantity}, need ${quantity}`), {status:409});
+  }
+  // No await between validation and mutation: the whole batch is atomic in this process.
+  for (const [sku,quantity] of totals) inventory.get(sku).quantity-=quantity;
+  if(requestId!==undefined) reservations.set(requestId,signature);
+  return {reserved:true};
+}
+
+function adminAllowed(req) {
+  const token=process.env.LAB_ADMIN_TOKEN;
+  return token && req.headers.authorization === `Bearer ${token}`;
+}
+
 async function handler(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const path = url.pathname.replace(/\/+$/, '') || '/';
   const method = (req.method || 'GET').toUpperCase();
 
   try {
+    if (path.startsWith('/__state/')) {
+      if (!adminAllowed(req)) return send(res,403,{error:'admin authorization required'});
+      const target=path==='/__state/orders'?orders:path==='/__state/inventory'?inventory:null;
+      if (!target) return send(res,404,{error:'not found'});
+      if (method==='GET') return send(res,200,target===inventory?{stock:Array.from(inventory.values()),reservations:Object.fromEntries(reservations)}:Array.from(orders.values()));
+      if (method==='PUT') {
+        const body=await readBody(req);
+        const rows=target===inventory?body?.stock:body;
+        const receipts=target===inventory?body?.reservations:null;
+        if(target===inventory && (!receipts || typeof receipts!=="object" || Array.isArray(receipts) || Object.entries(receipts).some(([key,value])=>!key || key.length>200 || typeof value!=="string" || value.length>16384)))return send(res,400,{error:"invalid reservation state"});
+        if (!Array.isArray(rows)) return send(res,400,{error:'state must be an array'});
+        const replacement=new Map();
+        for (const row of rows) {
+          const key=target===orders?row?.id:row?.sku;
+          const valid=target===orders ? typeof key==='string' && key && !validateOrderCreate(row) && row.status==='confirmed' && Number.isFinite(Date.parse(row.createdAt)) : typeof key==='string' && key && typeof row.name==='string' && Number.isSafeInteger(row.quantity) && row.quantity>=0;
+          if (!valid || replacement.has(key)) return send(res,400,{error:'invalid state row'});
+          replacement.set(key,row);
+        }
+        target.clear();for(const [key,row] of replacement) target.set(key,row);
+        if(target===inventory){reservations.clear();for(const [key,value]of Object.entries(receipts))reservations.set(key,value);}
+        return send(res,200,{imported:rows.length});
+      }
+      return send(res,405,{error:'method not allowed'});
+    }
+    if (method==='POST' && path==='/inventory/reservations') {
+      const body=await readBody(req);return send(res,200,reserveBatch(body.items,req.headers["idempotency-key"]));
+    }
+
     if (method === 'GET' && path === '/health') {
-      return send(res, 200, { status: 'ok', service: 'legacy-monolith' });
+      return send(res, 200, { status: 'ok', service: 'legacy-monolith', runId:process.env.LAB_RUN_ID||null });
     }
 
     if (method === 'POST' && path === '/orders') {
       const body = await readBody(req);
       const verr = validateOrderCreate(body);
       if (verr) return send(res, 400, { error: verr });
-      const order = createOrder(body);
+      const order = createOrder(body,req.headers["idempotency-key"] || body.requestId || randomUUID());
       return send(res, 201, order);
     }
 
