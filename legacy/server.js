@@ -15,6 +15,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 
 /** @type {Map<string, object>} */
 const orders = new Map();
+const reservations = new Map();
 
 /** @type {Map<string, { sku: string, name: string, quantity: number }>} */
 const inventory = new Map([
@@ -60,12 +61,18 @@ function validateOrderCreate(body) {
   return null;
 }
 
-function createOrder(body) {
-  reserveBatch(body.items);
+function createOrder(body, requestId = body.requestId || randomUUID()) {
+  if (typeof requestId !== 'string' || !requestId || requestId.length>200) throw Object.assign(new Error('invalid idempotency key'),{status:400});
+  for (const order of orders.values()) if (order.requestId===requestId) {
+    if (order.customerId!==body.customerId || JSON.stringify(order.items)!==JSON.stringify(body.items.map(item=>({sku:item.sku,quantity:item.quantity})))) throw Object.assign(new Error('idempotency key reused with different order'),{status:409});
+    return order;
+  }
+  reserveBatch(body.items,requestId);
 
   const id = randomUUID();
   const order = {
     id,
+    requestId,
     customerId: body.customerId,
     items: body.items.map((i) => ({ sku: i.sku, quantity: i.quantity })),
     status: 'confirmed',
@@ -110,8 +117,16 @@ function reserveInventory(sku, quantity) {
   };
 }
 
-function reserveBatch(items) {
+function reserveBatch(items, requestId) {
   if (!Array.isArray(items) || !items.length) throw Object.assign(new Error('items (non-empty array) required'), {status:400});
+  const signature=JSON.stringify(items.map(item=>({sku:item?.sku,quantity:item?.quantity})));
+  if (requestId!==undefined) {
+    if (typeof requestId!=='string' || !requestId || requestId.length>200) throw Object.assign(new Error('invalid idempotency key'),{status:400});
+    if (reservations.has(requestId)) {
+      if (reservations.get(requestId)!==signature) throw Object.assign(new Error('idempotency key reused with different reservation'),{status:409});
+      return {reserved:true};
+    }
+  }
   const totals = new Map();
   for (const item of items) {
     if (!item || typeof item.sku !== 'string' || !item.sku || !Number.isSafeInteger(item.quantity) || item.quantity < 1) throw Object.assign(new Error('invalid reservation item'), {status:400});
@@ -126,6 +141,7 @@ function reserveBatch(items) {
   }
   // No await between validation and mutation: the whole batch is atomic in this process.
   for (const [sku,quantity] of totals) inventory.get(sku).quantity-=quantity;
+  if(requestId!==undefined) reservations.set(requestId,signature);
   return {reserved:true};
 }
 
@@ -144,9 +160,12 @@ async function handler(req, res) {
       if (!adminAllowed(req)) return send(res,403,{error:'admin authorization required'});
       const target=path==='/__state/orders'?orders:path==='/__state/inventory'?inventory:null;
       if (!target) return send(res,404,{error:'not found'});
-      if (method==='GET') return send(res,200,Array.from(target.values()));
+      if (method==='GET') return send(res,200,target===inventory?{stock:Array.from(inventory.values()),reservations:Object.fromEntries(reservations)}:Array.from(orders.values()));
       if (method==='PUT') {
-        const rows=await readBody(req);
+        const body=await readBody(req);
+        const rows=target===inventory?body?.stock:body;
+        const receipts=target===inventory?body?.reservations:null;
+        if(target===inventory && (!receipts || typeof receipts!=="object" || Array.isArray(receipts) || Object.entries(receipts).some(([key,value])=>!key || key.length>200 || typeof value!=="string" || value.length>16384)))return send(res,400,{error:"invalid reservation state"});
         if (!Array.isArray(rows)) return send(res,400,{error:'state must be an array'});
         const replacement=new Map();
         for (const row of rows) {
@@ -156,12 +175,13 @@ async function handler(req, res) {
           replacement.set(key,row);
         }
         target.clear();for(const [key,row] of replacement) target.set(key,row);
+        if(target===inventory){reservations.clear();for(const [key,value]of Object.entries(receipts))reservations.set(key,value);}
         return send(res,200,{imported:rows.length});
       }
       return send(res,405,{error:'method not allowed'});
     }
     if (method==='POST' && path==='/inventory/reservations') {
-      const body=await readBody(req);return send(res,200,reserveBatch(body.items));
+      const body=await readBody(req);return send(res,200,reserveBatch(body.items,req.headers["idempotency-key"]));
     }
 
     if (method === 'GET' && path === '/health') {
@@ -172,7 +192,7 @@ async function handler(req, res) {
       const body = await readBody(req);
       const verr = validateOrderCreate(body);
       if (verr) return send(res, 400, { error: verr });
-      const order = createOrder(body);
+      const order = createOrder(body,req.headers["idempotency-key"] || body.requestId || randomUUID());
       return send(res, 201, order);
     }
 

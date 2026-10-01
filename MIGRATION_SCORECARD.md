@@ -2,18 +2,19 @@
 
 This is a local in-memory exercise. The hash chain detects accidental edits against its existing prefix; it is not an immutable log, authenticated signature, or proof against a writer who replaces the whole file. New entries use full SHA-256; historical 16-character hashes remain unchanged. Corrupt ledgers fail closed and concurrent writers use an exclusive directory lock.
 
-Latest controlled run: 2026-10-01T12:19:38.171Z
+Latest controlled run: 2026-10-01T12:26:01.372Z
 
 - Contract assertions: 24/24.
 - Completed shadow reads: 6; matches: 6; divergences: 0; transport failures: 0.
 - Preserved order IDs: 4; stock: 100 → 90.
-- Healthy-service state transfer/rollback: 1.748 ms in this one run.
+- Healthy-service state transfer/rollback: 2.295 ms in this one run.
 
 Checks:
 
 - prior order IDs survive promotion and rollback
 - stock continuity across all three routes
 - multi-item and duplicate-SKU rejection is atomic
+- idempotency replay survives cutover and rollback without consuming stock twice
 - completed read-only shadow sample passes gate
 - healthy-service rollback and re-promotion preserve state
 
@@ -45,3 +46,4 @@ Historical events before EVIDENCE_CORRECTION contain unsupported broad claims an
 | 15 | 2026-10-01T12:16:15.047Z | EVIDENCE_CORRECTION | correction/process | 04f82756c4ed1e477b68ba12858854a2c6166ed1b013465300f967b8bc894e2b |
 | 16 | 2026-10-01T12:16:16.763Z | VALIDATED_LAB_RUN | controlled run | 47ac1fd4dc91fe06b9a3fdbb03402ca4a81237c70fbfd66aab98a43d20e044ce |
 | 17 | 2026-10-01T12:19:38.171Z | VALIDATED_LAB_RUN | controlled run | 26ff8396dfe8023116e27a4feca7005fe0b0e00aa95fb3292ecab865c4d392b5 |
+| 18 | 2026-10-01T12:26:01.372Z | VALIDATED_LAB_RUN | controlled run | bbd98d7f51062bca15ab714e84ecbdcef4694deb7df835d9a123f569ff9ac82a |

@@ -330,6 +330,86 @@
       },
       "prevHash": "47ac1fd4dc91fe06b9a3fdbb03402ca4a81237c70fbfd66aab98a43d20e044ce",
       "hash": "26ff8396dfe8023116e27a4feca7005fe0b0e00aa95fb3292ecab865c4d392b5"
+    },
+    {
+      "id": 18,
+      "eventType": "VALIDATED_LAB_RUN",
+      "timestamp": "2026-10-01T12:26:01.372Z",
+      "details": {
+        "runId": "14d90260-b301-482e-9b53-a464f7fc90ea",
+        "contract": {
+          "timestamp": "2026-10-01T12:26:00.199Z",
+          "success": true,
+          "totalTests": 24,
+          "passedTests": 24,
+          "failedTests": 0,
+          "skippedTests": 0,
+          "cancelledTests": 0,
+          "passRate": 100,
+          "scope": "observed assertions; no invented per-domain coverage"
+        },
+        "shadow": {
+          "timestamp": "2026-10-01T12:26:01.350Z",
+          "totalSamplesDispatched": 6,
+          "shadowRequestsDispatched": 6,
+          "shadowRequestsEvaluated": 6,
+          "shadowPending": 0,
+          "shadowMatches": 6,
+          "shadowFailures": 0,
+          "divergenceCount": 0,
+          "divergenceRate": 0,
+          "averageLatencyMs": 0.3693333333333333,
+          "status": "SAMPLED_PARITY",
+          "scope": "controlled read-only lab samples; not production drift or SLA evidence"
+        },
+        "gate": {
+          "timestamp": "2026-10-01T12:26:01.350Z",
+          "gateApproved": true,
+          "checks": [
+            {
+              "name": "Observed contract tests all pass",
+              "passed": true,
+              "actual": 24
+            },
+            {
+              "name": "All dispatched shadow samples completed",
+              "passed": true,
+              "actual": 6
+            },
+            {
+              "name": "No response divergence or transport failures",
+              "passed": true,
+              "actual": 0
+            },
+            {
+              "name": "Observed candidate mean latency below 50 ms",
+              "passed": true,
+              "actual": 0.3693333333333333
+            }
+          ],
+          "verdict": "GATE_APPROVED_FOR_LAB_PROMOTION"
+        },
+        "rollbackMs": 2.2951200000002245,
+        "verifiedOrders": 4,
+        "initialQuantity": 100,
+        "finalQuantity": 90,
+        "checks": [
+          "prior order IDs survive promotion and rollback",
+          "stock continuity across all three routes",
+          "multi-item and duplicate-SKU rejection is atomic",
+          "idempotency replay survives cutover and rollback without consuming stock twice",
+          "completed read-only shadow sample passes gate",
+          "healthy-service rollback and re-promotion preserve state"
+        ],
+        "limitations": [
+          "in-memory lab; no process-crash durability",
+          "service-direct writes bypass the gateway barrier",
+          "no production traffic, failure-rate or decommission certification",
+          "rollback requires reachable source services to transfer state"
+        ]
+      },
+      "prevHash": "26ff8396dfe8023116e27a4feca7005fe0b0e00aa95fb3292ecab865c4d392b5",
+      "hash": "bbd98d7f51062bca15ab714e84ecbdcef4694deb7df835d9a123f569ff9ac82a"
     }
   ]
 }

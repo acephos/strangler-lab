@@ -22,3 +22,24 @@ func TestBatchReservationIsAtomicAndAggregatesDuplicateSKU(t *testing.T) {
 		t.Fatal("duplicate quantities not aggregated")
 	}
 }
+func TestReservationReceiptsDeduplicateAndRejectChangedPayload(t *testing.T) {
+	store := NewStore()
+	items := []BatchItem{{"SKU-COFFEE-01", 2}}
+	if err := store.ReserveBatch(items, "fixture-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveBatch(items, "fixture-key"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := store.Get("SKU-COFFEE-01")
+	if after.Quantity != 98 {
+		t.Fatal("duplicate receipt reserved twice")
+	}
+	if store.ReserveBatch([]BatchItem{{"SKU-COFFEE-01", 3}}, "fixture-key") == nil {
+		t.Fatal("changed payload reused receipt")
+	}
+	after, _ = store.Get("SKU-COFFEE-01")
+	if after.Quantity != 98 {
+		t.Fatal("rejected replay changed stock")
+	}
+}

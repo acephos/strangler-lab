@@ -33,12 +33,14 @@ type errorBody struct {
 }
 
 type Store struct {
-	mu    sync.Mutex
-	stock map[string]*Stock
+	mu           sync.Mutex
+	stock        map[string]*Stock
+	reservations map[string]string
 }
 
 func NewStore() *Store {
 	return &Store{
+		reservations: make(map[string]string),
 		stock: map[string]*Stock{
 			"SKU-COFFEE-01":  {SKU: "SKU-COFFEE-01", Name: "House Blend Beans 1kg", Quantity: 100},
 			"SKU-MUG-12":     {SKU: "SKU-MUG-12", Name: "Ceramic Mug 12oz", Quantity: 40},
@@ -116,7 +118,7 @@ type BatchItem struct {
 	Quantity int    `json:"quantity"`
 }
 
-func (s *Store) ReserveBatch(items []BatchItem) error {
+func (s *Store) ReserveBatch(items []BatchItem, keys ...string) error {
 	if len(items) == 0 {
 		return &httpError{400, "items (non-empty array) required"}
 	}
@@ -127,8 +129,25 @@ func (s *Store) ReserveBatch(items []BatchItem) error {
 		}
 		totals[item.SKU] += item.Quantity
 	}
+	signatureBytes, _ := json.Marshal(items)
+	signature := string(signatureBytes)
+	key := ""
+	if len(keys) > 0 {
+		key = keys[0]
+	}
+	if len(key) > 200 {
+		return &httpError{400, "invalid idempotency key"}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if key != "" {
+		if prior, exists := s.reservations[key]; exists {
+			if prior != signature {
+				return &httpError{409, "idempotency key reused with different reservation"}
+			}
+			return nil
+		}
+	}
 	for sku, qty := range totals {
 		stock, ok := s.stock[sku]
 		if !ok {
@@ -141,6 +160,9 @@ func (s *Store) ReserveBatch(items []BatchItem) error {
 	for sku, qty := range totals {
 		s.stock[sku].Quantity -= qty
 	}
+	if key != "" {
+		s.reservations[key] = signature
+	}
 	return nil
 }
 func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +173,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, errorBody{Error: "invalid JSON body"})
 		return
 	}
-	if err := s.store.ReserveBatch(body.Items); err != nil {
+	if err := s.store.ReserveBatch(body.Items, r.Header.Get("Idempotency-Key")); err != nil {
 		e := err.(*httpError)
 		writeJSON(w, e.status, errorBody{Error: e.msg})
 		return
@@ -170,14 +192,32 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		for _, row := range s.store.stock {
 			rows = append(rows, *row)
 		}
+		receipts := make(map[string]string)
+		for key, value := range s.store.reservations {
+			receipts[key] = value
+		}
 		s.store.mu.Unlock()
-		writeJSON(w, 200, rows)
+		writeJSON(w, 200, map[string]any{"stock": rows, "reservations": receipts})
 		return
 	}
-	var rows []Stock
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&rows); err != nil {
+	var state struct {
+		Stock        []Stock           `json:"stock"`
+		Reservations map[string]string `json:"reservations"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&state); err != nil {
 		writeJSON(w, 400, errorBody{Error: "invalid state"})
 		return
+	}
+	rows := state.Stock
+	if state.Reservations == nil {
+		writeJSON(w, 400, errorBody{Error: "invalid reservation state"})
+		return
+	}
+	for key, value := range state.Reservations {
+		if key == "" || len(key) > 200 || len(value) > 16384 {
+			writeJSON(w, 400, errorBody{Error: "invalid reservation state"})
+			return
+		}
 	}
 	replacement := make(map[string]*Stock)
 	for _, row := range rows {
@@ -194,6 +234,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.mu.Lock()
 	s.store.stock = replacement
+	s.store.reservations = state.Reservations
 	s.store.mu.Unlock()
 	writeJSON(w, 200, map[string]int{"imported": len(rows)})
 }

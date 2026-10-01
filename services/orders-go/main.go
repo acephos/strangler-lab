@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ type OrderItem struct {
 }
 
 type Order struct {
+	RequestID  string      `json:"requestId,omitempty"`
 	ID         string      `json:"id"`
 	CustomerID string      `json:"customerId"`
 	Items      []OrderItem `json:"items"`
@@ -32,6 +34,7 @@ type Order struct {
 }
 
 type createOrderRequest struct {
+	RequestID  string      `json:"requestId,omitempty"`
 	CustomerID string      `json:"customerId"`
 	Items      []OrderItem `json:"items"`
 }
@@ -42,7 +45,7 @@ type errorBody struct {
 
 // InventoryClient reserves stock in the inventory service (or legacy via gateway).
 type InventoryClient interface {
-	ReserveBatch(items []OrderItem) error
+	ReserveBatch(requestID string, items []OrderItem) error
 }
 
 type HTTPInventoryClient struct {
@@ -50,7 +53,7 @@ type HTTPInventoryClient struct {
 	HTTPClient *http.Client
 }
 
-func (c *HTTPInventoryClient) ReserveBatch(items []OrderItem) error {
+func (c *HTTPInventoryClient) ReserveBatch(requestID string, items []OrderItem) error {
 	payload, err := json.Marshal(map[string]any{"items": items})
 	if err != nil {
 		return err
@@ -62,6 +65,7 @@ func (c *HTTPInventoryClient) ReserveBatch(items []OrderItem) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Lab-Internal", os.Getenv("LAB_ADMIN_TOKEN"))
+	req.Header.Set("Idempotency-Key", requestID)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return err
@@ -99,6 +103,23 @@ func NewStore(inv InventoryClient) *Store {
 }
 
 func (s *Store) Create(req createOrderRequest) (Order, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if req.RequestID == "" {
+		req.RequestID = uuid.NewString()
+	}
+	if len(req.RequestID) > 200 {
+		return Order{}, &httpError{400, "invalid idempotency key"}
+	}
+	for _, prior := range s.orders {
+		if prior.RequestID == req.RequestID {
+			if prior.CustomerID != req.CustomerID || !reflect.DeepEqual(prior.Items, req.Items) {
+				return Order{}, &httpError{409, "idempotency key reused with different order"}
+			}
+			return prior, nil
+		}
+	}
+
 	if req.CustomerID == "" {
 		return Order{}, &httpError{status: http.StatusBadRequest, msg: "customerId (string) required"}
 	}
@@ -114,11 +135,12 @@ func (s *Store) Create(req createOrderRequest) (Order, error) {
 		}
 	}
 
-	if err := s.inv.ReserveBatch(req.Items); err != nil {
+	if err := s.inv.ReserveBatch(req.RequestID, req.Items); err != nil {
 		return Order{}, err
 	}
 
 	o := Order{
+		RequestID:  req.RequestID,
 		ID:         uuid.NewString(),
 		CustomerID: req.CustomerID,
 		Items:      append([]OrderItem(nil), req.Items...),
@@ -126,9 +148,7 @@ func (s *Store) Create(req createOrderRequest) (Order, error) {
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
 
-	s.mu.Lock()
 	s.orders[o.ID] = o
-	s.mu.Unlock()
 	return o, nil
 }
 
@@ -220,6 +240,9 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid JSON body"})
 		return
+	}
+	if key := r.Header.Get("Idempotency-Key"); key != "" {
+		req.RequestID = key
 	}
 	order, err := s.store.Create(req)
 	if err != nil {
