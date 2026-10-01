@@ -92,6 +92,9 @@ type Server struct {
 func NewServer(store *Store) *Server {
 	s := &Server{store: store, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /health", s.handleHealth)
+	s.mux.HandleFunc("GET /__state/inventory", s.handleState)
+	s.mux.HandleFunc("PUT /__state/inventory", s.handleState)
+	s.mux.HandleFunc("POST /inventory/reservations", s.handleBatch)
 	s.mux.HandleFunc("GET /inventory/{sku}", s.handleGet)
 	s.mux.HandleFunc("POST /inventory/{sku}/reserve", s.handleReserve)
 	return s
@@ -108,8 +111,95 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+type BatchItem struct {
+	SKU      string `json:"sku"`
+	Quantity int    `json:"quantity"`
+}
+
+func (s *Store) ReserveBatch(items []BatchItem) error {
+	if len(items) == 0 {
+		return &httpError{400, "items (non-empty array) required"}
+	}
+	totals := make(map[string]int)
+	for _, item := range items {
+		if item.SKU == "" || item.Quantity < 1 || item.Quantity > int(^uint(0)>>1)-totals[item.SKU] {
+			return &httpError{400, "invalid reservation item"}
+		}
+		totals[item.SKU] += item.Quantity
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sku, qty := range totals {
+		stock, ok := s.stock[sku]
+		if !ok {
+			return &httpError{404, "unknown sku: " + sku}
+		}
+		if stock.Quantity < qty {
+			return &httpError{409, fmt.Sprintf("insufficient stock for %s: have %d, need %d", sku, stock.Quantity, qty)}
+		}
+	}
+	for sku, qty := range totals {
+		s.stock[sku].Quantity -= qty
+	}
+	return nil
+}
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Items []BatchItem `json:"items"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, 400, errorBody{Error: "invalid JSON body"})
+		return
+	}
+	if err := s.store.ReserveBatch(body.Items); err != nil {
+		e := err.(*httpError)
+		writeJSON(w, e.status, errorBody{Error: e.msg})
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"reserved": true})
+}
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	token := os.Getenv("LAB_ADMIN_TOKEN")
+	if token == "" || r.Header.Get("Authorization") != "Bearer "+token {
+		writeJSON(w, 403, errorBody{Error: "admin authorization required"})
+		return
+	}
+	if r.Method == http.MethodGet {
+		s.store.mu.Lock()
+		rows := make([]Stock, 0, len(s.store.stock))
+		for _, row := range s.store.stock {
+			rows = append(rows, *row)
+		}
+		s.store.mu.Unlock()
+		writeJSON(w, 200, rows)
+		return
+	}
+	var rows []Stock
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&rows); err != nil {
+		writeJSON(w, 400, errorBody{Error: "invalid state"})
+		return
+	}
+	replacement := make(map[string]*Stock)
+	for _, row := range rows {
+		if row.SKU == "" || row.Name == "" || row.Quantity < 0 {
+			writeJSON(w, 400, errorBody{Error: "invalid state row"})
+			return
+		}
+		if _, ok := replacement[row.SKU]; ok {
+			writeJSON(w, 400, errorBody{Error: "duplicate state row"})
+			return
+		}
+		copy := row
+		replacement[row.SKU] = &copy
+	}
+	s.store.mu.Lock()
+	s.store.stock = replacement
+	s.store.mu.Unlock()
+	writeJSON(w, 200, map[string]int{"imported": len(rows)})
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "inventory-go"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "inventory-go", "runId": os.Getenv("LAB_RUN_ID")})
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +235,7 @@ func main() {
 	port := envOr("PORT", "8082")
 	store := NewStore()
 	srv := NewServer(store)
-	addr := ":" + port
+	addr := envOr("HOST", "127.0.0.1") + ":" + port
 	log.Printf("inventory-go listening on %s", addr)
 	if err := http.ListenAndServe(addr, srv); err != nil {
 		log.Fatal(err)
